@@ -31,6 +31,9 @@ import json
 import multiprocessing
 import os
 import os.path as p
+import pandas as pd
+import glob
+import cv2
 
 from absl import app
 from absl import flags
@@ -46,32 +49,27 @@ from dataset import tfrecord_util
 flags.DEFINE_boolean(
     'include_masks', False, 'Whether to include instance segmentations masks '
                             '(PNG encoded) in the result. default: False.')
-flags.DEFINE_string('image_dir', '', 'Directory containing images.')
-flags.DEFINE_string(
-    'image_info_file', '', 'File containing image information. '
-                           'Tf Examples in the output files correspond to the image '
-                           'info entries in this file. If this file is not provided '
-                           'object_annotations_file is used if present. Otherwise, '
-                           'caption_annotations_file is used to get image info.')
+flags.DEFINE_string('basedir', '/media/data/niccolo/', 'Directory containing everything.')
+
 flags.DEFINE_string(
     'object_annotations_file', '', 'File containing object '
                                    'annotations - boxes and instance masks.')
-flags.DEFINE_string('caption_annotations_file', '', 'File containing image '
-                                                    'captions.')
-flags.DEFINE_string('output_file_prefix', '/tmp/train', 'Path to output file')
-flags.DEFINE_integer('num_shards', 32, 'Number of shards for output file.')
-flags.DEFINE_integer('num_threads', None, 'Number of threads to run.')
+
+flags.DEFINE_string('output_file_prefix', '/media/data/niccolo/tmp/train', 'Path to output file')
+flags.DEFINE_integer('num_shards', 128, 'Number of shards for output file.')
+flags.DEFINE_integer('num_threads', 6, 'Number of threads to run.')
 FLAGS = flags.FLAGS
 
 
-def create_tf_example(image,
+def create_tf_example(img_path,
                       image_dir,
                       bbox_annotations=None,
                       category_index=None,
+                      category_df=None,
                       caption_annotations=None,
                       include_masks=False):
     """Converts image and annotations to a tf.Example proto.
-  
+
     Args:
       image: dict with keys: [u'license', u'file_name', u'coco_url', u'height',
         u'width', u'date_captured', u'flickr_url', u'id']
@@ -92,11 +90,11 @@ def create_tf_example(image,
         list of dict with keys: [u'id', u'image_id', u'str'].
       include_masks: Whether to include instance segmentations masks
         (PNG encoded) in the result. default: False.
-  
+
     Returns:
       example: The converted tf.Example
       num_annotations_skipped: Number of (invalid) annotations that were ignored.
-  
+
     Raises:
       ValueError: if the image pointed to by data['filename'] is not a valid JPEG
     """
@@ -106,7 +104,7 @@ def create_tf_example(image,
     image_width = width
     filename = p.basename(img_path)
     image_id = _get_img_id(img_path)
-    
+
     with tf.gfile.GFile(img_path, 'rb') as fid:
         encoded_jpg = fid.read()
     key = hashlib.sha256(encoded_jpg).hexdigest()
@@ -126,7 +124,7 @@ def create_tf_example(image,
         'image/format':
             tfrecord_util.bytes_feature('jpeg'.encode('utf8')),
     }
-    
+
     num_annotations_skipped = 0
     if bbox_annotations:
         xmin = []
@@ -149,10 +147,10 @@ def create_tf_example(image,
             category_names.append(invClassDict[category_id].encode('utf8'))
             area.append(height * width * (object_annotations["XMax"]-object_annotations["XMin"])
                         *(object_annotations["YMax"]-object_annotations["YMin"]))
-            
-           if include_masks:
+
+            if include_masks: ##### todo todo todo
                 run_len_encoding = mask.frPyObjects(object_annotations['segmentation'],
-                                                    image_height, image_width)
+                                                        image_height, image_width)
                 binary_mask = mask.decode(run_len_encoding)
                 if not object_annotations['iscrowd']:
                     binary_mask = np.amax(binary_mask, axis=2)
@@ -160,8 +158,8 @@ def create_tf_example(image,
                 output_io = io.BytesIO()
                 pil_image.save(output_io, format='PNG')
                 encoded_mask_png.append(output_io.getvalue())
-                
-        
+
+
         feature_dict.update({
             'image/object/bbox/xmin':
                 tfrecord_util.float_list_feature(xmin),
@@ -180,12 +178,14 @@ def create_tf_example(image,
             'image/object/area':
                 tfrecord_util.float_list_feature(area),
         })
-        if include_masks:
+
+        if include_masks:  ### todotodotodo
             feature_dict['image/object/mask'] = (
                 tfrecord_util.bytes_list_feature(encoded_mask_png))
-    
+
     example = tf.train.Example(features=tf.train.Features(feature=feature_dict))
-    return key, example, num_annotations_skipped
+
+    return example, num_annotations_skipped
 
 
 def _pool_create_tf_example(args):
@@ -194,76 +194,45 @@ def _pool_create_tf_example(args):
 
 def _load_object_annotations(annotations_bbox_fname, category_index):
     """Loads object annotation JSON file."""
-    
+
     annotations_bbox = pd.read_csv(annotations_bbox_fname,
                                    usecols=["ImageID", "LabelName", "XMin", "XMax", "YMin", "YMax"])
-    
+
     annotations_bbox = annotations_bbox[annotations_bbox["LabelName"].isin(category_index)]
     images = annotations_bbox["ImageID"].unique()
-    
-    img_to_obj_annotation = defaultdict(list)
+
+    img_to_obj_annotation = collections.defaultdict(list)
     logging.info('Building bounding box index.')
     for annotation in annotations_bbox.iterrows():
         image_id = annotation[1]["ImageID"]
-        
+
         img_to_obj_annotation[image_id].append(annotation[1])
 
     missing_annotation_count = 0
     for image in images:
         if image not in img_to_obj_annotation:
             missing_annotation_count += 1
-    
+
     logging.info('%d images are missing bboxes.', missing_annotation_count)
-    
+
     return img_to_obj_annotation
-
-
-def _load_classes_info(classes_fname, mask_fname, base_path):
-    #classes_list = pd.read_csv(p.join(base_path, classes_fname), header=None)
-    #classes_list = classes_list.dropna()
-    
-    def parse_str(stringa):
-        return stringa.replace(" ", "_").replace("_(Animal)", "")
-    
-    def parse_id(stringa):
-        return stringa.replace("/", "")
-    
-    reader = csv.reader(open(p.join(base_path, classes_fname)))
-    classDict = {}
-    invClassDict = {}
-    for line in reader:
-        idc, name = line
-        name = parse_str(name)
-        classDict[name] = idc
-        invClassDict[idc] = name
-        
-    classes = [parse_str(x) for x in classDict.keys()]
-    category_index = invClassDict.keys()
-
-    reader = csv.reader(open(p.join(base_path, mask_fname)))
-    
-    has_mask_dict = {}
-    for line in reader:
-        class_id, hasmask = line
-        has_mask_dict[class_id] = hasmask
-    return classes, category_index, classDict, invClassDict, has_mask_dict
 
 
 def _get_img_id(image_path):
     return os.path.basename(image_path.replace(".jpg", ""))
-    
-    
-def _create_tf_record_from_animal_annotations(base_dir,
+
+
+def _create_tf_record_from_animal_annotations(basedir,
                                             image_dir,
                                             output_path,
                                             num_shards,
                                             object_annotations_file,
-                                            classes_csv, mask_csv,
+                                            category_df,
                                             segmentation_fname,
                                             include_masks=False,
                                             ):
     """Loads COCO annotation json files and converts to tf.Record format.
-  
+
     Args:
       image_info_file: JSON file containing image info. The number of tf.Examples
         in the output tf Record files is exactly equal to the number of image info
@@ -279,70 +248,69 @@ def _create_tf_record_from_animal_annotations(base_dir,
       include_masks: Whether to include instance segmentations masks
         (PNG encoded) in the result. default: False.
     """
-    
+
     logging.info('writing to output path: %s', output_path)
     writers = [
         tf.python_io.TFRecordWriter(output_path + '-%05d-of-%05d.tfrecord' %
                                     (i, num_shards)) for i in range(num_shards)
     ]
-    images = glob.glob(p.join(image_dir, "Centipode", "train", "*.jpg"))  # example
-
-    classes, category_index, classDict, invClassDict, has_mask_dict = \
-        _load_classes_info(classes_fname, mask_fname, base_dir)
+    images = glob.glob(p.join(image_dir, "Centipede", "train", "*.jpg"))  # example
 
     img_to_obj_annotation = None
-    
+
     img_to_obj_annotation = (
-        _load_object_annotations(object_annotations_file, category_index))
-    
+        _load_object_annotations(p.join(basedir, object_annotations_file), category_df["cat"].values))
+
     def _get_object_annotation(image_id):
         return img_to_obj_annotation[image_id]
-        
+
+    include_masks=False
     pool = multiprocessing.Pool(FLAGS.num_threads)
     total_num_annotations_skipped = 0
-    for idx, (_, tf_example, num_annotations_skipped) in enumerate(
+    for idx, (tf_example, num_annotations_skipped) in enumerate(
             pool.imap(
                 _pool_create_tf_example,
                 [(image, _get_object_annotation(_get_img_id(image)),
-                  category_index, include_masks)
+                   category_df["cat"].values, category_df, include_masks)
                  for image in images])):
         if idx % 100 == 0:
             logging.info('On image %d of %d', idx, len(images))
-        
+
         total_num_annotations_skipped += num_annotations_skipped
         writers[idx % num_shards].write(tf_example.SerializeToString())
-    
+
     pool.close()
     pool.join()
-    
+
     for writer in writers:
         writer.close()
-    
+
     logging.info('Finished writing, skipped %d annotations.',
                  total_num_annotations_skipped)
 
 
 def main(_):
-    assert FLAGS.base_dir, '`base dir` missing.'
-    base_dir = FLAGS.base_dir
-    image_dir = p.join(base_dir, "images")
+    assert FLAGS.basedir, '`base dir` missing.'
+    basedir = FLAGS.basedir
+    image_dir = p.join(basedir, "images")
 
-    classes_csv = "classes.csv"
-    mask_csv = "hasmask.csv"
+    categories_csv = "categories.csv"
     annotations_bbox_fname = 'oidv6-train-annotations-bbox.csv'
     class_descriptions_fname = 'class-descriptions-boxable.csv'
     train_segmentation_fname = 'train-annotations-object-segmentation.csv'
     train_boxable = "train-images-boxable-with-rotation.csv"
-    
+
     directory = os.path.dirname(FLAGS.output_file_prefix)
     if not tf.gfile.IsDirectory(directory):
         tf.gfile.MakeDirs(directory)
-    
-    _create_tf_record_from_animal_annotations(base_dir, FLAGS.image_dir,
+
+    category_df = pd.read_csv(p.join(basedir, categories_csv), index_col=0)
+
+    _create_tf_record_from_animal_annotations(basedir, image_dir,
                                             FLAGS.output_file_prefix,
                                             FLAGS.num_shards,
                                             annotations_bbox_fname,
-                                            classes_csv, mask_csv,
+                                            category_df,
                                             train_segmentation_fname,
                                             FLAGS.include_masks
                                             )
