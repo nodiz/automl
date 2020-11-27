@@ -71,7 +71,19 @@ def visualize_image(image,
   return img
 
 
+class ExportNetwork(tf.Module):
+
+  def __init__(self, model):
+    super().__init__()
+    self.model = model
+
+  @tf.function
+  def __call__(self, imgs):
+    return tf.nest.flatten(self.model(imgs, training=False))
+
+
 class ExportModel(tf.Module):
+  """Model to be exported as SavedModel/TFLite format."""
 
   def __init__(self, model):
     super().__init__()
@@ -82,7 +94,7 @@ class ExportModel(tf.Module):
     return self.model(imgs, training=False, post_mode='global')
 
 
-class ServingDriver(object):
+class ServingDriver:
   """A driver for serving single or batch images.
 
   This driver supports serving with image files or arrays, with configurable
@@ -135,8 +147,7 @@ class ServingDriver(object):
                model_name: Text,
                ckpt_path: Text = None,
                batch_size: int = 1,
-               min_score_thresh: float = None,
-               max_boxes_to_draw: float = None,
+               only_network: bool = False,
                model_params: Dict[Text, Any] = None):
     """Initialize the inference driver.
 
@@ -144,14 +155,14 @@ class ServingDriver(object):
       model_name: target model name, such as efficientdet-d0.
       ckpt_path: checkpoint path, such as /tmp/efficientdet-d0/.
       batch_size: batch size for inference.
-      min_score_thresh: minimal score threshold for filtering predictions.
-      max_boxes_to_draw: the maximum number of boxes per image.
+      only_network: only use the network without pre/post processing.
       model_params: model parameters for overriding the config.
     """
     super().__init__()
     self.model_name = model_name
     self.ckpt_path = ckpt_path
     self.batch_size = batch_size
+    self.only_network = only_network
 
     self.params = hparams_config.get_detection_config(model_name).as_dict()
 
@@ -160,15 +171,23 @@ class ServingDriver(object):
     self.params.update(dict(is_training_bn=False))
     self.label_map = self.params.get('label_map', None)
 
-    self.model = None
+    self._model = None
 
-    self.min_score_thresh = min_score_thresh
-    self.max_boxes_to_draw = max_boxes_to_draw
     mixed_precision = self.params.get('mixed_precision', None)
     precision = utils.get_precision(
         self.params.get('strategy', None), mixed_precision)
     policy = tf.keras.mixed_precision.experimental.Policy(precision)
     tf.keras.mixed_precision.experimental.set_policy(policy)
+
+  @property
+  def model(self):
+    if not self._model:
+      self.build()
+    return self._model
+
+  @model.setter
+  def model(self, model):
+    self._model = model
 
   def build(self, params_override=None):
     """Build model and restore checkpoints."""
@@ -177,11 +196,15 @@ class ServingDriver(object):
       params.update(params_override)
     config = hparams_config.get_efficientdet_config(self.model_name)
     config.override(params)
-    self.model = efficientdet_keras.EfficientDetModel(config=config)
+    if self.only_network:
+      self.model = efficientdet_keras.EfficientDetNet(config=config)
+    else:
+      self.model = efficientdet_keras.EfficientDetModel(config=config)
     image_size = utils.parse_image_size(params['image_size'])
     self.model.build((self.batch_size, *image_size, 3))
     util_keras.restore_ckpt(self.model, self.ckpt_path,
-                            params['moving_average_decay'])
+                            self.params['moving_average_decay'],
+                            skip_mismatch=False)
 
   def visualize(self, image, boxes, classes, scores, **kwargs):
     """Visualize prediction on image."""
@@ -196,12 +219,10 @@ class ServingDriver(object):
       bm_runs: Number of benchmark runs.
       trace_filename: If None, specify the filename for saving trace.
     """
-    if not self.model:
-      self.build()
-
-    @tf.function
+    _, spec = self._get_model_and_spec()
+    @tf.function(input_signature=[spec])
     def test_func(image_arrays):
-      return self.model(image_arrays)
+      return self.model(image_arrays)  # pylint: disable=not-callable
 
     for _ in range(3):  # warmup 3 runs.
       test_func(image_arrays)
@@ -231,15 +252,24 @@ class ServingDriver(object):
     Returns:
       A list of detections.
     """
-    if not self.model:
-      self.build()
-    return self.model(image_arrays)
+    if isinstance(self.model, tf.lite.Interpreter):
+      input_details = self.model.get_input_details()
+      output_details = self.model.get_output_details()
+      self.model.set_tensor(input_details[0]['index'], np.array(image_arrays))
+      self.model.invoke()
+      return [self.model.get_tensor(x['index']) for x in output_details]
+    return self.model(image_arrays)  # pylint: disable=not-callable
 
   def load(self, saved_model_dir_or_frozen_graph: Text):
     """Load the model using saved model or a frozen graph."""
     # Load saved model if it is a folder.
     if tf.saved_model.contains_saved_model(saved_model_dir_or_frozen_graph):
       self.model = tf.saved_model.load(saved_model_dir_or_frozen_graph)
+      return
+
+    if saved_model_dir_or_frozen_graph.endswith('.tflite'):
+      self.model = tf.lite.Interpreter(saved_model_dir_or_frozen_graph)
+      self.model.allocate_tensors()
       return
 
     # Load a frozen graph.
@@ -269,45 +299,78 @@ class ServingDriver(object):
     _, graphdef = convert_variables_to_constants_v2_as_graph(func)
     return graphdef
 
+  def _get_model_and_spec(self):
+    """Get model instance and export spec."""
+    if self.only_network:
+      image_size = utils.parse_image_size(self.params['image_size'])
+      spec = tf.TensorSpec(
+          shape=[self.batch_size, *image_size, 3],
+          dtype=tf.float32,
+          name='images')
+      export_model = ExportNetwork(self.model)
+      return export_model, spec
+    else:
+      spec = tf.TensorSpec(
+          shape=[self.batch_size, None, None, 3], dtype=tf.uint8, name='images')
+      export_model = ExportModel(self.model)
+      return export_model, spec
+
   def export(self,
-             output_dir: Text,
-             tflite_path: Text = None,
-             tensorrt: Text = None):
+             output_dir: Text = None,
+             tensorrt: Text = None,
+             tflite: Text = None):
     """Export a saved model, frozen graph, and potential tflite/tensorrt model.
 
     Args:
       output_dir: the output folder for saved model.
-      tflite_path: the path for saved tflite file.
       tensorrt: If not None, must be {'FP32', 'FP16', 'INT8'}.
+      tflite: Type for post-training quantization.
     """
-    if not self.model:
-      self.build()
-    export_model = ExportModel(self.model)
-    tf.saved_model.save(
-        export_model,
-        output_dir,
-        signatures=export_model.__call__.get_concrete_function(
-            tf.TensorSpec(
-                shape=[None, None, None, 3], dtype=tf.uint8, name='images')))
-    logging.info('Model saved at %s', output_dir)
+    export_model, input_spec = self._get_model_and_spec()
+    image_size = utils.parse_image_size(self.params['image_size'])
+    if output_dir:
+      tf.saved_model.save(
+          export_model,
+          output_dir,
+          signatures=export_model.__call__.get_concrete_function(input_spec))
+      logging.info('Model saved at %s', output_dir)
 
-    # also save freeze pb file.
-    graphdef = self.freeze(
-        export_model.__call__.get_concrete_function(
-            tf.TensorSpec(
-                shape=[None, None, None, 3], dtype=tf.uint8, name='images')))
-    proto_path = tf.io.write_graph(
-        graphdef, output_dir, self.model_name + '_frozen.pb', as_text=False)
-    logging.info('Frozen graph saved at %s', proto_path)
+      # also save freeze pb file.
+      graphdef = self.freeze(
+          export_model.__call__.get_concrete_function(input_spec))
+      proto_path = tf.io.write_graph(
+          graphdef, output_dir, self.model_name + '_frozen.pb', as_text=False)
+      logging.info('Frozen graph saved at %s', proto_path)
 
-    if tflite_path:
-      # Neither of the two approaches works so far.
-      converter = tf.lite.TFLiteConverter.from_keras_model(self.model)
-      converter.optimizations = [tf.lite.Optimize.DEFAULT]
-      converter.target_spec.supported_types = [tf.float16]
-      # converter = tf.lite.TFLiteConverter.from_saved_model(output_dir)
-      # converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS]
+    if tflite:
+      shape = (self.batch_size, *image_size, 3)
+      input_spec = tf.TensorSpec(
+          shape=shape, dtype=input_spec.dtype, name=input_spec.name)
+      converter = tf.lite.TFLiteConverter.from_concrete_functions(
+          [export_model.__call__.get_concrete_function(input_spec)])
+      if tflite == 'FP32':
+        converter.optimizations = [tf.lite.Optimize.DEFAULT]
+        converter.target_spec.supported_types = [tf.float32]
+      elif tflite == 'FP16':
+        converter.optimizations = [tf.lite.Optimize.DEFAULT]
+        converter.target_spec.supported_types = [tf.float16]
+      elif tflite == 'INT8':
+        num_calibration_steps = 10
 
+        def representative_dataset_gen():  # rewrite this for real data.
+          for _ in range(num_calibration_steps):
+            yield [tf.ones(shape, dtype=input_spec.dtype)]
+        converter.representative_dataset = representative_dataset_gen
+        converter.optimizations = [tf.lite.Optimize.DEFAULT]
+        converter.inference_input_type = tf.uint8
+        converter.inference_output_type = tf.uint8
+        converter.target_spec.supported_ops = [
+            tf.lite.OpsSet.TFLITE_BUILTINS_INT8
+        ]
+      else:
+        raise ValueError(f'Invalid tflite {tflite}: must be FP32, FP16, INT8.')
+
+      tflite_path = os.path.join(output_dir, tflite.lower() + '.tflite')
       tflite_model = converter.convert()
       tf.io.gfile.GFile(tflite_path, 'wb').write(tflite_model)
       logging.info('TFLite is saved at %s', tflite_path)

@@ -36,7 +36,7 @@ GlobalParams = collections.namedtuple('GlobalParams', [
     'num_classes', 'width_coefficient', 'depth_coefficient', 'depth_divisor',
     'min_depth', 'survival_prob', 'relu_fn', 'batch_norm', 'use_se',
     'local_pooling', 'condconv_num_experts', 'clip_projection_output',
-    'blocks_args', 'fix_head_stem'
+    'blocks_args', 'fix_head_stem', 'grad_checkpoint'
 ])
 GlobalParams.__new__.__defaults__ = (None,) * len(GlobalParams._fields)
 
@@ -369,48 +369,52 @@ class MBConvBlock(tf.keras.layers.Layer):
     Returns:
       A output tensor.
     """
-    logging.info('Block %s input shape: %s', self.name, inputs.shape)
-    x = inputs
+    @utils.recompute_grad(self._global_params.grad_checkpoint)
+    def _call(inputs):
+      logging.info('Block %s input shape: %s', self.name, inputs.shape)
+      x = inputs
 
-    # creates conv 2x2 kernel
-    if self.super_pixel:
-      x = self.super_pixel(x, training)
-      logging.info('SuperPixel %s: %s', self.name, x.shape)
+      # creates conv 2x2 kernel
+      if self.super_pixel:
+        x = self.super_pixel(x, training)
+        logging.info('SuperPixel %s: %s', self.name, x.shape)
 
-    if self._block_args.fused_conv:
-      # If use fused mbconv, skip expansion and use regular conv.
-      x = self._relu_fn(self._bn1(self._fused_conv(x), training=training))
-      logging.info('Conv2D shape: %s', x.shape)
-    else:
-      # Otherwise, first apply expansion and then apply depthwise conv.
-      if self._block_args.expand_ratio != 1:
-        x = self._relu_fn(self._bn0(self._expand_conv(x), training=training))
-        logging.info('Expand shape: %s', x.shape)
+      if self._block_args.fused_conv:
+        # If use fused mbconv, skip expansion and use regular conv.
+        x = self._relu_fn(self._bn1(self._fused_conv(x), training=training))
+        logging.info('Conv2D shape: %s', x.shape)
+      else:
+        # Otherwise, first apply expansion and then apply depthwise conv.
+        if self._block_args.expand_ratio != 1:
+          x = self._relu_fn(self._bn0(self._expand_conv(x), training=training))
+          logging.info('Expand shape: %s', x.shape)
 
-      x = self._relu_fn(self._bn1(self._depthwise_conv(x), training=training))
-      logging.info('DWConv shape: %s', x.shape)
+        x = self._relu_fn(self._bn1(self._depthwise_conv(x), training=training))
+        logging.info('DWConv shape: %s', x.shape)
 
-    if self._se:
-      x = self._se(x)
+      if self._se:
+        x = self._se(x)
 
-    self.endpoints = {'expansion_output': x}
+      self.endpoints = {'expansion_output': x}
 
-    x = self._bn2(self._project_conv(x), training=training)
-    # Add identity so that quantization-aware training can insert quantization
-    # ops correctly.
-    x = tf.identity(x)
-    if self._clip_projection_output:
-      x = tf.clip_by_value(x, -6, 6)
-    if self._block_args.id_skip:
-      if all(
-          s == 1 for s in self._block_args.strides
-      ) and self._block_args.input_filters == self._block_args.output_filters:
-        # Apply only if skip connection presents.
-        if survival_prob:
-          x = utils.drop_connect(x, training, survival_prob)
-        x = tf.add(x, inputs)
-    logging.info('Project shape: %s', x.shape)
-    return x
+      x = self._bn2(self._project_conv(x), training=training)
+      # Add identity so that quantization-aware training can insert quantization
+      # ops correctly.
+      x = tf.identity(x)
+      if self._clip_projection_output:
+        x = tf.clip_by_value(x, -6, 6)
+      if self._block_args.id_skip:
+        if all(
+            s == 1 for s in self._block_args.strides
+        ) and self._block_args.input_filters == self._block_args.output_filters:
+          # Apply only if skip connection presents.
+          if survival_prob:
+            x = utils.drop_connect(x, training, survival_prob)
+          x = tf.add(x, inputs)
+      logging.info('Project shape: %s', x.shape)
+      return x
+
+    return _call(inputs)
 
 
 class MBConvBlockWithoutDepthwise(MBConvBlock):
@@ -419,15 +423,22 @@ class MBConvBlockWithoutDepthwise(MBConvBlock):
   def _build(self):
     """Builds block according to the arguments."""
     filters = self._block_args.input_filters * self._block_args.expand_ratio
+    # pylint: disable=g-long-lambda
+    cid = itertools.count(0)
+    get_conv_name = lambda: 'conv2d' + ('' if not next(cid) else '_' + str(
+        next(cid) // 2))
+    # pylint: enable=g-long-lambda
+    kernel_size = self._block_args.kernel_size
     if self._block_args.expand_ratio != 1:
       # Expansion phase:
       self._expand_conv = tf.keras.layers.Conv2D(
           filters,
-          kernel_size=[3, 3],
+          kernel_size=[kernel_size, kernel_size],
           strides=[1, 1],
           kernel_initializer=conv_kernel_initializer,
           padding='same',
-          use_bias=False)
+          use_bias=False,
+          name=get_conv_name())
       self._bn0 = self._batch_norm(
           axis=self._channel_axis,
           momentum=self._batch_norm_momentum,
@@ -441,7 +452,8 @@ class MBConvBlockWithoutDepthwise(MBConvBlock):
         strides=self._block_args.strides,
         kernel_initializer=conv_kernel_initializer,
         padding='same',
-        use_bias=False)
+        use_bias=False,
+        name=get_conv_name())
     self._bn1 = self._batch_norm(
         axis=self._channel_axis,
         momentum=self._batch_norm_momentum,
@@ -458,32 +470,38 @@ class MBConvBlockWithoutDepthwise(MBConvBlock):
     Returns:
       A output tensor.
     """
-    logging.info('Block %s  input shape: %s', self.name, inputs.shape)
-    if self._block_args.expand_ratio != 1:
-      x = self._relu_fn(self._bn0(self._expand_conv(inputs), training=training))
-    else:
-      x = inputs
-    logging.info('Expand shape: %s', x.shape)
 
-    self.endpoints = {'expansion_output': x}
+    @utils.recompute_grad(self._global_params.grad_checkpoint)
+    def _call(inputs):
+      logging.info('Block %s  input shape: %s', self.name, inputs.shape)
+      if self._block_args.expand_ratio != 1:
+        x = self._relu_fn(
+            self._bn0(self._expand_conv(inputs), training=training))
+      else:
+        x = inputs
+      logging.info('Expand shape: %s', x.shape)
 
-    x = self._bn1(self._project_conv(x), training=training)
-    # Add identity so that quantization-aware training can insert quantization
-    # ops correctly.
-    x = tf.identity(x)
-    if self._clip_projection_output:
-      x = tf.clip_by_value(x, -6, 6)
+      self.endpoints = {'expansion_output': x}
 
-    if self._block_args.id_skip:
-      if all(
-          s == 1 for s in self._block_args.strides
-      ) and self._block_args.input_filters == self._block_args.output_filters:
-        # Apply only if skip connection presents.
-        if survival_prob:
-          x = utils.drop_connect(x, training, survival_prob)
-        x = tf.add(x, inputs)
-    logging.info('Project shape: %s', x.shape)
-    return x
+      x = self._bn1(self._project_conv(x), training=training)
+      # Add identity so that quantization-aware training can insert quantization
+      # ops correctly.
+      x = tf.identity(x)
+      if self._clip_projection_output:
+        x = tf.clip_by_value(x, -6, 6)
+
+      if self._block_args.id_skip:
+        if all(
+            s == 1 for s in self._block_args.strides
+        ) and self._block_args.input_filters == self._block_args.output_filters:
+          # Apply only if skip connection presents.
+          if survival_prob:
+            x = utils.drop_connect(x, training, survival_prob)
+          x = tf.add(x, inputs)
+      logging.info('Project shape: %s', x.shape)
+      return x
+
+    return _call(inputs)
 
 
 class Stem(tf.keras.layers.Layer):

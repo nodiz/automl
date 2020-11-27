@@ -61,8 +61,8 @@ def build_batch_norm(is_training_bn: bool,
 
 def get_ema_vars(model):
   """Get all exponential moving average (ema) variables."""
-  ema_vars = model.trainable_variables
-  for v in model.variables:
+  ema_vars = model.trainable_weights
+  for v in model.weights:
     # We maintain mva for batch norm moving mean and variance as well.
     if 'moving_mean' in v.name or 'moving_variance' in v.name:
       ema_vars.append(v)
@@ -93,7 +93,7 @@ def average_name(ema, var):
       var.name.split(':')[0] + '/' + ema.name, mark_as_used=False)
 
 
-def restore_ckpt(model, ckpt_path_or_file, ema_decay=0.9998):
+def restore_ckpt(model, ckpt_path_or_file, ema_decay=0.9998, skip_mismatch=True):
   """Restore variables from a given checkpoint.
 
   Args:
@@ -106,23 +106,38 @@ def restore_ckpt(model, ckpt_path_or_file, ema_decay=0.9998):
     return
   if tf.io.gfile.isdir(ckpt_path_or_file):
     ckpt_path_or_file = tf.train.latest_checkpoint(ckpt_path_or_file)
-  if ema_decay > 0:
-    ema = tf.train.ExponentialMovingAverage(decay=0.0)
-    ema_vars = get_ema_vars(model)
-    var_dict = {
-        average_name(ema, var): var for (ref, var) in ema_vars.items()
-    }
-  else:
-    ema_vars = get_ema_vars(model)
-    var_dict = {var.name.split(':')[0]: var for (ref, var) in ema_vars.items()}
-  # add variables that not in var_dict
-  for v in model.variables:
-    if v.ref() not in ema_vars:
-      var_dict[v.name.split(':')[0]] = v
-  # try to load graph-based checkpoint with ema support,
-  # else load checkpoint via keras.load_weights which doesn't support ema.
-  try:
-    for key, var in var_dict.items():
-      var.assign(tf.train.load_variable(ckpt_path_or_file, key))
-  except tf.errors.NotFoundError:
+
+  if (tf.train.list_variables(ckpt_path_or_file)[0][0] ==
+      '_CHECKPOINTABLE_OBJECT_GRAPH'):
     model.load_weights(ckpt_path_or_file)
+  else:
+    if ema_decay > 0:
+      ema = tf.train.ExponentialMovingAverage(decay=0.0)
+      ema_vars = get_ema_vars(model)
+      var_dict = {
+          average_name(ema, var): var for (ref, var) in ema_vars.items()
+      }
+    else:
+      ema_vars = get_ema_vars(model)
+      var_dict = {
+          var.name.split(':')[0]: var for (ref, var) in ema_vars.items()
+      }
+    # add variables that not in var_dict
+    for v in model.weights:
+      if v.ref() not in ema_vars:
+        var_dict[v.name.split(':')[0]] = v
+    # try to load graph-based checkpoint with ema support,
+    # else load checkpoint via keras.load_weights which doesn't support ema.
+    for key, var in var_dict.items():
+      try:
+        var.assign(tf.train.load_variable(ckpt_path_or_file, key))
+      except tf.errors.NotFoundError as e:
+        if skip_mismatch:
+          logging.warning('Not found %s in %s', key, ckpt_path_or_file)
+        else:
+          raise e
+      except ValueError as e:
+        if skip_mismatch:
+          logging.warning('%s: %s', key, e)
+        else:
+          raise e

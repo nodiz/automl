@@ -39,6 +39,18 @@ class InferenceTest(tf.test.TestCase):
     driver.load(saved_model_path)
     driver.load(os.path.join(saved_model_path, 'efficientdet-d0_frozen.pb'))
 
+  def test_export_tflite(self):
+    saved_model_path = os.path.join(self.tmp_path, 'saved_model')
+    driver = inference.ServingDriver(
+        'efficientdet-d0', self.tmp_path, only_network=True)
+    driver.export(saved_model_path, tflite='FP32')
+    self.assertTrue(
+        tf.io.gfile.exists(os.path.join(saved_model_path, 'fp32.tflite')))
+    tf.io.gfile.rmtree(saved_model_path)
+    driver.export(saved_model_path, tflite='FP16')
+    self.assertTrue(
+        tf.io.gfile.exists(os.path.join(saved_model_path, 'fp16.tflite')))
+
   def test_inference(self):
     driver = inference.ServingDriver('efficientdet-d0', self.tmp_path)
     images = tf.ones((1, 512, 512, 3))
@@ -65,6 +77,14 @@ class InferenceTest(tf.test.TestCase):
     self.assertEqual(scores.shape, (1, 100))
     self.assertEqual(classes.shape, (1, 100))
     self.assertEqual(valid_lens.shape, (1,))
+
+  def test_network_inference(self):
+    driver = inference.ServingDriver(
+        'efficientdet-d0', self.tmp_path, only_network=True)
+    images = tf.ones((1, 512, 512, 3))
+    class_outputs, box_outputs = driver.serve(images)
+    self.assertLen(class_outputs, 5)
+    self.assertLen(box_outputs, 5)
 
   def test_inference_mixed_precision(self):
     driver = inference.ServingDriver('efficientdet-d0', self.tmp_path)

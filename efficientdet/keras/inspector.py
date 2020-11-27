@@ -35,8 +35,9 @@ flags.DEFINE_string('trace_filename', None, 'Trace file name.')
 flags.DEFINE_integer('bm_runs', 10, 'Number of benchmark runs.')
 flags.DEFINE_string('tensorrt', None, 'TensorRT mode: {None, FP32, FP16, INT8}')
 flags.DEFINE_integer('batch_size', 1, 'Batch size for inference.')
+flags.DEFINE_integer('image_size', -1, 'Input image size for inference.')
 
-flags.DEFINE_string('ckpt_path', '_', 'checkpoint dir used for eval.')
+flags.DEFINE_string('model_dir', '_', 'checkpoint dir used for eval.')
 flags.DEFINE_string('export_ckpt', None, 'Output model ckpt path.')
 
 flags.DEFINE_string(
@@ -51,16 +52,11 @@ flags.DEFINE_string('input_video', None, 'Input video path for inference.')
 flags.DEFINE_string('output_video', None,
                     'Output video path. If None, play it online instead.')
 
-# For visualization.
-flags.DEFINE_integer('max_boxes_to_draw', 100, 'Max number of boxes to draw.')
-flags.DEFINE_float('min_score_thresh', 0.4, 'Score threshold to show box.')
-flags.DEFINE_string('nms_method', 'hard', 'nms method, hard or gaussian.')
-
 # For saved model.
-flags.DEFINE_string('saved_model_dir', '/tmp/saved_model',
-                    'Folder path for saved model.')
-flags.DEFINE_string('tflite_path', None, 'Path for exporting tflite file.')
+flags.DEFINE_string('saved_model_dir', None, 'Folder path for saved model.')
+flags.DEFINE_string('tflite', None, 'tflite type: {FP32, FP16, INT8}.')
 flags.DEFINE_bool('debug', False, 'Debug mode.')
+flags.DEFINE_bool('only_network', False, 'Model only contains network')
 FLAGS = flags.FLAGS
 
 
@@ -73,44 +69,45 @@ def main(_):
   model_config = hparams_config.get_detection_config(FLAGS.model_name)
   model_config.override(FLAGS.hparams)  # Add custom overrides
   model_config.is_training_bn = False
+  if FLAGS.image_size != -1:
+    model_config.image_size = FLAGS.image_size
   model_config.image_size = utils.parse_image_size(model_config.image_size)
 
-  # A hack to make flag consistent with nms configs.
-  if FLAGS.min_score_thresh:
-    model_config.nms_configs.score_thresh = FLAGS.min_score_thresh
-  if FLAGS.nms_method:
-    model_config.nms_configs.method = FLAGS.nms_method
-  if FLAGS.max_boxes_to_draw:
-    model_config.nms_configs.max_output_size = FLAGS.max_boxes_to_draw
-
   model_params = model_config.as_dict()
-  ckpt_path_or_file = FLAGS.ckpt_path
+  ckpt_path_or_file = FLAGS.model_dir
   if tf.io.gfile.isdir(ckpt_path_or_file):
     ckpt_path_or_file = tf.train.latest_checkpoint(ckpt_path_or_file)
   driver = inference.ServingDriver(FLAGS.model_name, ckpt_path_or_file,
                                    FLAGS.batch_size or None,
-                                   FLAGS.min_score_thresh,
-                                   FLAGS.max_boxes_to_draw, model_params)
+                                   FLAGS.only_network, model_params)
   if FLAGS.mode == 'export':
-    if tf.io.gfile.exists(FLAGS.saved_model_dir):
-      tf.io.gfile.rmtree(FLAGS.saved_model_dir)
-    driver.export(FLAGS.saved_model_dir, FLAGS.tflite_path, FLAGS.tensorrt)
+    if not FLAGS.saved_model_dir:
+      raise ValueError('Please specify --saved_model_dir=')
+    model_dir = FLAGS.saved_model_dir
+    if tf.io.gfile.exists(model_dir):
+      tf.io.gfile.rmtree(model_dir)
+    driver.export(model_dir, FLAGS.tensorrt, FLAGS.tflite)
+    print('Model are exported to %s' % model_dir)
   elif FLAGS.mode == 'infer':
-    if FLAGS.saved_model_dir:
-      driver.load(FLAGS.saved_model_dir)
     image_file = tf.io.read_file(FLAGS.input_image)
     image_arrays = tf.io.decode_image(image_file)
     image_arrays.set_shape((None, None, 3))
     image_arrays = tf.expand_dims(image_arrays, axis=0)
+    if FLAGS.saved_model_dir:
+      driver.load(FLAGS.saved_model_dir)
+      if FLAGS.saved_model_dir.endswith('.tflite'):
+        image_size = utils.parse_image_size(model_config.image_size)
+        image_arrays = tf.image.resize_with_pad(image_arrays, *image_size)
+        image_arrays = tf.cast(image_arrays, tf.uint8)
     detections_bs = driver.serve(image_arrays)
     boxes, scores, classes, _ = tf.nest.map_structure(np.array, detections_bs)
-    raw_image = Image.open(FLAGS.input_image)
+    raw_image = Image.fromarray(np.array(image_arrays)[0])
     img = driver.visualize(
         raw_image,
         boxes[0],
         classes[0],
         scores[0],
-        min_score_thresh=model_config.nms_configs.score_thresh,
+        min_score_thresh=model_config.nms_configs.score_thresh or 0.4,
         max_boxes_to_draw=model_config.nms_configs.max_output_size)
     output_image_path = os.path.join(FLAGS.output_image_dir, '0.jpg')
     Image.fromarray(img).save(output_image_path)
@@ -139,7 +136,7 @@ def main(_):
       driver.model.save_weights(FLAGS.export_ckpt)
   elif FLAGS.mode == 'video':
     import cv2  # pylint: disable=g-import-not-at-top
-    if tf.saved_model.contains_saved_model(FLAGS.saved_model_dir):
+    if FLAGS.saved_model_dir:
       driver.load(FLAGS.saved_model_dir)
     cap = cv2.VideoCapture(FLAGS.input_video)
     if not cap.isOpened():
@@ -157,16 +154,15 @@ def main(_):
       ret, frame = cap.read()
       if not ret:
         break
-
       raw_frames = np.array([frame])
       detections_bs = driver.serve(raw_frames)
       boxes, scores, classes, _ = tf.nest.map_structure(np.array, detections_bs)
       new_frame = driver.visualize(
           raw_frames[0],
           boxes[0],
-          scores[0],
           classes[0],
-          min_score_thresh=model_config.nms_configs.score_thresh,
+          scores[0],
+          min_score_thresh=model_config.nms_configs.score_thresh or 0.4,
           max_boxes_to_draw=model_config.nms_configs.max_output_size)
 
       if out_ptr:

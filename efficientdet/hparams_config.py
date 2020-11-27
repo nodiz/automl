@@ -50,6 +50,9 @@ class Config(object):
   def __repr__(self):
     return repr(self.as_dict())
 
+  def __deepcopy__(self, memodict={}):
+    return type(self)(self.as_dict())
+
   def __str__(self):
     try:
       return yaml.dump(self.as_dict(), indent=4)
@@ -142,7 +145,7 @@ class Config(object):
           """Recursively merge two nested dictionary."""
           for k in src.keys():
             if ((k in target and isinstance(target[k], dict) and
-                 isinstance(src[k], collections.Mapping))):
+                 isinstance(src[k], collections.abc.Mapping))):
               merge_dict_recursive(target[k], src[k])
             else:
               target[k] = src[k]
@@ -181,10 +184,9 @@ def default_detection_configs():
   h.jitter_min = 0.1
   h.jitter_max = 2.0
   h.autoaugment_policy = None
-  h.use_augmix = False
-  # mixture_width, mixture_depth, alpha
-  h.augmix_params = [3, -1, 1]
+  h.grid_mask = False
   h.sample_image = None
+  h.map_freq = 5  # AP eval frequency in epochs.
 
   # dataset specific parameters
   # TODO(tanmingxing): update this to be 91 for COCO, and 21 for pascal.
@@ -236,6 +238,8 @@ def default_detection_configs():
   h.weight_decay = 4e-5
   h.strategy = None  # 'tpu', 'gpus', None
   h.mixed_precision = False  # If False, use float32.
+  h.loss_scale = 2**10  # If False, use float32.
+  h.model_optimizations = {}  # 'prune'
 
   # For detection.
   h.box_class_repeats = 3
@@ -251,8 +255,9 @@ def default_detection_configs():
   h.nms_configs = {
       'method': 'gaussian',
       'iou_thresh': None,  # use the default value based on method.
-      'score_thresh': None,
+      'score_thresh': 0.,
       'sigma': None,
+      'pyfunc': False,
       'max_nms_inputs': 0,
       'max_output_size': 100,
   }
@@ -280,21 +285,7 @@ def default_detection_configs():
   h.use_keras_model = True
   h.dataset_type = None
   h.positives_momentum = None
-
-  # For device specific options.
-  h.device = {
-      # If true, apply gradient checkpointing to reduce memory usage.
-      'grad_ckpting': False,
-      # All ops in the list will be checkpointed, such as Add/Mul/Conv2d/Floor/
-      # Sigmoid and other ops, or more specific, e.g. blocks_10/se/conv2d_1.
-      # Adding more ops will save more memory at the cost of more computation.
-      # For EfficientDet, [Add_, AddN] reduces mbconv memory to one third
-      # with one third more compute, in particular enabling training d6 with
-      # batch size 2 on 11Gb (2080ti).
-      'grad_ckpting_list': ['Add_', 'AddN'],
-      # enable memory logging for NVIDIA cards.
-      'nvgpu_logging': False,
-  }
+  h.grad_checkpoint = False
 
   return h
 
@@ -395,51 +386,59 @@ efficientdet_lite_param_dict = {
         dict(
             name='efficientdet-lite0',
             backbone_name='efficientnet-lite0',
-            image_size=512,
+            image_size=320,
             fpn_num_filters=64,
             fpn_cell_repeats=3,
             box_class_repeats=3,
             act_type='relu',
+            fpn_weight_method='sum',
+            anchor_scale=3.0,
         ),
     'efficientdet-lite1':
         dict(
             name='efficientdet-lite1',
             backbone_name='efficientnet-lite1',
-            image_size=640,
+            image_size=384,
             fpn_num_filters=88,
             fpn_cell_repeats=4,
             box_class_repeats=3,
             act_type='relu',
+            fpn_weight_method='sum',
+            anchor_scale=3.0,
         ),
     'efficientdet-lite2':
         dict(
             name='efficientdet-lite2',
             backbone_name='efficientnet-lite2',
-            image_size=768,
+            image_size=448,
             fpn_num_filters=112,
             fpn_cell_repeats=5,
             box_class_repeats=3,
             act_type='relu',
+            fpn_weight_method='sum',
+            anchor_scale=3.0,
         ),
     'efficientdet-lite3':
         dict(
             name='efficientdet-lite3',
             backbone_name='efficientnet-lite3',
-            image_size=896,
+            image_size=512,
             fpn_num_filters=160,
             fpn_cell_repeats=6,
             box_class_repeats=4,
             act_type='relu',
+            fpn_weight_method='sum',
         ),
     'efficientdet-lite4':
         dict(
             name='efficientdet-lite4',
             backbone_name='efficientnet-lite4',
-            image_size=1024,
+            image_size=512,
             fpn_num_filters=224,
             fpn_cell_repeats=7,
             box_class_repeats=4,
             act_type='relu',
+            fpn_weight_method='sum',
         ),
 }
 

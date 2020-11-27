@@ -22,8 +22,10 @@ import tensorflow as tf
 import dataloader
 import hparams_config
 import utils
+from keras import tfmot
 from keras import train_lib
 from keras import util_keras
+
 
 # Cloud TPU Cluster Resolvers
 flags.DEFINE_string(
@@ -77,33 +79,66 @@ flags.DEFINE_integer('iterations_per_loop', 100,
 flags.DEFINE_string(
     'training_file_pattern', None,
     'Glob for training data files (e.g., COCO train - minival set)')
-flags.DEFINE_string('validation_file_pattern', None,
+flags.DEFINE_string('val_file_pattern', None,
                     'Glob for evaluation tfrecords (e.g., COCO val2017 set)')
 flags.DEFINE_string(
     'val_json_file', None,
     'COCO validation JSON containing golden bounding boxes. If None, use the '
     'ground truth from the dataloader. Ignored if testdev_dir is not None.')
-flags.DEFINE_string('testdev_dir', None,
-                    'COCO testdev dir. If not None, ignorer val_json_file.')
+
 flags.DEFINE_integer('num_examples_per_epoch', 120000,
                      'Number of examples in one epoch')
 flags.DEFINE_integer('num_epochs', None, 'Number of epochs for training')
-flags.DEFINE_string('mode', 'train',
-                    'Mode to run: train or eval (default: train)')
 flags.DEFINE_string('model_name', 'efficientdet-d1', 'Model name.')
-flags.DEFINE_bool('eval_after_training', False, 'Run one eval after the '
-                  'training finishes.')
 flags.DEFINE_bool('debug', False, 'Enable debug mode')
+flags.DEFINE_integer(
+    'tf_random_seed', 111111,
+    'Fixed random seed for deterministic execution across runs for debugging.')
 flags.DEFINE_bool('profile', False, 'Enable profile mode')
 
-# For Eval mode
-flags.DEFINE_integer('min_eval_interval', 180,
-                     'Minimum seconds between evaluations.')
-flags.DEFINE_integer(
-    'eval_timeout', None,
-    'Maximum seconds between checkpoints before evaluation terminates.')
-
 FLAGS = flags.FLAGS
+
+
+def setup_model(config):
+  """Build and compile model."""
+  model = train_lib.EfficientDetNetTrain(config=config)
+  model.build((None, *config.image_size, 3))
+  model.compile(
+      optimizer=train_lib.get_optimizer(config.as_dict()),
+      loss={
+          train_lib.BoxLoss.__name__:
+              train_lib.BoxLoss(
+                  config.delta, reduction=tf.keras.losses.Reduction.NONE),
+          train_lib.BoxIouLoss.__name__:
+              train_lib.BoxIouLoss(
+                  config.iou_loss_type,
+                  config.min_level,
+                  config.max_level,
+                  config.num_scales,
+                  config.aspect_ratios,
+                  config.anchor_scale,
+                  config.image_size,
+                  reduction=tf.keras.losses.Reduction.NONE),
+          train_lib.FocalLoss.__name__:
+              train_lib.FocalLoss(
+                  config.alpha,
+                  config.gamma,
+                  label_smoothing=config.label_smoothing,
+                  reduction=tf.keras.losses.Reduction.NONE),
+          tf.keras.losses.SparseCategoricalCrossentropy.__name__:
+              tf.keras.losses.SparseCategoricalCrossentropy(
+                  from_logits=True,
+                  reduction=tf.keras.losses.Reduction.NONE)}
+      )
+  return model
+
+
+def init_experimental(config):
+  """Serialize train config to model directory."""
+  tf.io.gfile.makedirs(config.model_dir)
+  config_file = os.path.join(config.model_dir, 'config.yaml')
+  if not tf.io.gfile.exists(config_file):
+    tf.io.gfile.GFile(config_file, 'w').write(str(config))
 
 
 def main(_):
@@ -124,7 +159,8 @@ def main(_):
   if FLAGS.debug:
     tf.config.experimental_run_functions_eagerly(True)
     tf.debugging.set_log_device_placement(True)
-    tf.random.set_seed(111111)
+    os.environ['TF_DETERMINISTIC_OPS'] = '1'
+    tf.random.set_seed(FLAGS.tf_random_seed)
     logging.set_verbosity(logging.DEBUG)
 
   if FLAGS.strategy == 'tpu':
@@ -143,38 +179,30 @@ def main(_):
     else:
       ds_strategy = tf.distribute.OneDeviceStrategy('device:CPU:0')
 
-  # Check data path
-  if FLAGS.mode in ('train',
-                    'train_and_eval') and FLAGS.training_file_pattern is None:
-    raise RuntimeError('You must specify --training_file_pattern for training.')
-  if FLAGS.mode in ('eval', 'train_and_eval'):
-    if FLAGS.validation_file_pattern is None:
-      raise RuntimeError('You must specify --validation_file_pattern '
-                         'for evaluation.')
-
   steps_per_epoch = FLAGS.num_examples_per_epoch // FLAGS.batch_size
   params = dict(
-      config.as_dict(),
+      profile=FLAGS.profile,
       model_name=FLAGS.model_name,
       iterations_per_loop=FLAGS.iterations_per_loop,
       model_dir=FLAGS.model_dir,
       steps_per_epoch=steps_per_epoch,
       strategy=FLAGS.strategy,
-      batch_size=FLAGS.batch_size // ds_strategy.num_replicas_in_sync,
-      num_shards=ds_strategy.num_replicas_in_sync,
+      batch_size=FLAGS.batch_size,
+      tf_random_seed=FLAGS.tf_random_seed,
+      debug=FLAGS.debug,
       val_json_file=FLAGS.val_json_file,
-      testdev_dir=FLAGS.testdev_dir,
-      mode=FLAGS.mode)
-
+      eval_samples=FLAGS.eval_samples,
+      num_shards=ds_strategy.num_replicas_in_sync)
+  config.override(params, True)
   # set mixed precision policy by keras api.
-  precision = utils.get_precision(params['strategy'], params['mixed_precision'])
+  precision = utils.get_precision(config.strategy, config.mixed_precision)
   policy = tf.keras.mixed_precision.experimental.Policy(precision)
   tf.keras.mixed_precision.experimental.set_policy(policy)
 
-  def get_dataset(is_training, params):
+  def get_dataset(is_training, config):
     file_pattern = (
         FLAGS.training_file_pattern
-        if is_training else FLAGS.validation_file_pattern)
+        if is_training else FLAGS.val_file_pattern)
     if not file_pattern:
       raise ValueError('No matching files.')
 
@@ -182,49 +210,25 @@ def main(_):
         file_pattern,
         is_training=is_training,
         use_fake_data=FLAGS.use_fake_data,
-        max_instances_per_image=config.max_instances_per_image)(
-            params)
+        max_instances_per_image=config.max_instances_per_image,
+        debug=FLAGS.debug)(
+            config.as_dict())
 
   with ds_strategy.scope():
-    model = train_lib.EfficientDetNetTrain(params['model_name'], config)
-    model.compile(
-        optimizer=train_lib.get_optimizer(params),
-        loss={
-            'box_loss':
-                train_lib.BoxLoss(
-                    params['delta'], reduction=tf.keras.losses.Reduction.NONE),
-            'box_iou_loss':
-                train_lib.BoxIouLoss(
-                    params['iou_loss_type'],
-                    params['min_level'],
-                    params['max_level'],
-                    params['num_scales'],
-                    params['aspect_ratios'],
-                    params['anchor_scale'],
-                    params['image_size'],
-                    reduction=tf.keras.losses.Reduction.NONE),
-            'class_loss':
-                train_lib.FocalLoss(
-                    params['alpha'],
-                    params['gamma'],
-                    label_smoothing=params['label_smoothing'],
-                    reduction=tf.keras.losses.Reduction.NONE),
-            'seg_loss':
-                tf.keras.losses.SparseCategoricalCrossentropy(
-                    from_logits=True,
-                    reduction=tf.keras.losses.Reduction.NONE)
-        })
-
+    if config.model_optimizations:
+      tfmot.set_config(config.model_optimizations.as_dict())
+    model = setup_model(config)
     if FLAGS.pretrained_ckpt:
       ckpt_path = tf.train.latest_checkpoint(FLAGS.pretrained_ckpt)
-      util_keras.restore_ckpt(model, ckpt_path, params['moving_average_decay'])
-    tf.io.gfile.makedirs(FLAGS.model_dir)
+      util_keras.restore_ckpt(model, ckpt_path, config.moving_average_decay)
+    init_experimental(config)
+    val_dataset = get_dataset(False, config).repeat()
     model.fit(
-        get_dataset(True, params=params),
-        epochs=params['num_epochs'],
+        get_dataset(True, config),
+        epochs=config.num_epochs,
         steps_per_epoch=steps_per_epoch,
-        callbacks=train_lib.get_callbacks(params, FLAGS.profile),
-        validation_data=get_dataset(False, params=params),
+        callbacks=train_lib.get_callbacks(config.as_dict(), val_dataset),
+        validation_data=val_dataset,
         validation_steps=(FLAGS.eval_samples // FLAGS.batch_size))
   model.save_weights(os.path.join(FLAGS.model_dir, 'ckpt-final'))
 
