@@ -220,6 +220,7 @@ class ServingDriver:
       trace_filename: If None, specify the filename for saving trace.
     """
     _, spec = self._get_model_and_spec()
+
     @tf.function(input_signature=[spec])
     def test_func(image_arrays):
       return self.model(image_arrays)  # pylint: disable=not-callable

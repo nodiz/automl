@@ -154,6 +154,7 @@ def main(_):
       ret, frame = cap.read()
       if not ret:
         break
+
       raw_frames = np.array([frame])
       detections_bs = driver.serve(raw_frames)
       boxes, scores, classes, _ = tf.nest.map_structure(np.array, detections_bs)
