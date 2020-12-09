@@ -111,7 +111,7 @@ flags.DEFINE_integer(
 
 # for train_and_eval mode
 flags.DEFINE_bool(
-    'run_epoch_in_child_process', True,
+    'run_epoch_in_child_process', False,
     'This option helps to rectify CPU memory leak. If True, every epoch is '
     'run in a separate process for train and eval and memory will be cleared.'
     'Drawback: need to kill 2 processes if trainining needs to be interrupted.')
@@ -355,6 +355,7 @@ def main(_):
         if p.exitcode != 0:
           return p.exitcode
       else:
+        tf.compat.v1.reset_default_graph()
         run_train_and_eval(e)
 
   else:
