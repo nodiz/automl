@@ -27,6 +27,8 @@ from keras import anchors
 from keras import efficientdet_keras
 from keras import postprocess
 
+from .hierarchy import Node, getHierarchy, constructBigMatrix
+
 _DEFAULT_BATCH_SIZE = 64
 
 
@@ -155,7 +157,9 @@ def focal_loss(y_pred, y_true, alpha, gamma, normalizer, label_smoothing=0.0):
 
     # compute focal loss multipliers before label smoothing, such that it will
     # not blow up the loss.
-    pred_prob = tf.sigmoid(y_pred)
+
+    pred_prob = tf.sigmoid(y_pred) # TensorShape([8, 40, 40, 9*numClasses])
+
     p_t = (y_true * pred_prob) + ((1 - y_true) * (1 - pred_prob))
     alpha_factor = y_true * alpha + (1 - y_true) * (1 - alpha)
     modulating_factor = (1.0 - p_t)**gamma
@@ -167,6 +171,7 @@ def focal_loss(y_pred, y_true, alpha, gamma, normalizer, label_smoothing=0.0):
 
     # compute the final loss and return
     return (1 / normalizer) * alpha_factor * modulating_factor * ce
+    # TensorShape([8, 80, 80, 909])
 
 
 def _box_loss(box_outputs, box_targets, num_positives, delta=0.1):
@@ -226,6 +231,8 @@ def detection_loss(cls_outputs, box_outputs, labels, params):
         momentum=params['positives_momentum'])
   elif positives_momentum < 0:
     num_positives_sum = utils.cross_replica_mean(num_positives_sum)
+  if params.has_key('use_hierarchy') and params['use_hierarchy']:
+      classHierarchy = getHierarchy() # list of node objects
 
   levels = cls_outputs.keys()
   cls_losses = []
@@ -236,6 +243,7 @@ def detection_loss(cls_outputs, box_outputs, labels, params):
         labels['cls_targets_%d' % level],
         params['num_classes'],
         dtype=cls_outputs[level].dtype)
+
 
     if params['data_format'] == 'channels_first':
       bs, _, width, height, _ = cls_targets_at_level.get_shape().as_list()
@@ -261,10 +269,16 @@ def detection_loss(cls_outputs, box_outputs, labels, params):
     else:
       cls_loss = tf.reshape(cls_loss,
                             [bs, width, height, -1, params['num_classes']])
+    # TensorShape([8, 80, 80, 9, 101])
+
+    target_classes_per_level = labels['cls_targets_%d']
+    hierarchyFactor = tf.constant(constructBigMatrix(target_classes_per_level))
+    cls_loss *= tf.cast(hierarchyFactor, cls_loss.dtype)
 
     cls_loss *= tf.cast(
         tf.expand_dims(tf.not_equal(labels['cls_targets_%d' % level], -2), -1),
         cls_loss.dtype)
+
     cls_loss_sum = tf.reduce_sum(cls_loss)
     cls_losses.append(tf.cast(cls_loss_sum, tf.float32))
 
@@ -632,3 +646,5 @@ def get_model_fn(model_name='efficientdet-d0'):
     return efficientdet_model_fn
 
   raise ValueError('Invalide model name {}'.format(model_name))
+
+
