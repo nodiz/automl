@@ -27,7 +27,7 @@ from keras import anchors
 from keras import efficientdet_keras
 from keras import postprocess
 
-from hierarchy import Node, getHierarchy, constructBigMatrix
+import hierarchy
 
 _DEFAULT_BATCH_SIZE = 64
 
@@ -231,8 +231,6 @@ def detection_loss(cls_outputs, box_outputs, labels, params):
         momentum=params['positives_momentum'])
   elif positives_momentum < 0:
     num_positives_sum = utils.cross_replica_mean(num_positives_sum)
-  if "use_hierarchy" in params and params['use_hierarchy']:
-      classHierarchy = getHierarchy() # list of node objects
 
   levels = cls_outputs.keys()
   cls_losses = []
@@ -243,7 +241,6 @@ def detection_loss(cls_outputs, box_outputs, labels, params):
         labels['cls_targets_%d' % level],
         params['num_classes'],
         dtype=cls_outputs[level].dtype)
-
 
     if params['data_format'] == 'channels_first':
       bs, _, width, height, _ = cls_targets_at_level.get_shape().as_list()
@@ -269,11 +266,16 @@ def detection_loss(cls_outputs, box_outputs, labels, params):
     else:
       cls_loss = tf.reshape(cls_loss,
                             [bs, width, height, -1, params['num_classes']])
+
+
     # TensorShape([8, 80, 80, 9, 101])
 
-    target_classes_per_level = labels['cls_targets_%d' % level]
-    hierarchyFactor = tf.constant(constructBigMatrix(target_classes_per_level))
-    cls_loss *= tf.cast(hierarchyFactor, cls_loss.dtype)
+    import pdb
+    pdb.set_trace()
+
+    if "use_hierarchy" in params and params['use_hierarchy']:
+        hierarchy_factor = cls_targets_at_level @ hierarchy.hierarchyMatrix
+        cls_loss *= hierarchy_factor
 
     cls_loss *= tf.cast(
         tf.expand_dims(tf.not_equal(labels['cls_targets_%d' % level], -2), -1),
