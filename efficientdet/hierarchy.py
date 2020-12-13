@@ -1,4 +1,5 @@
 import pickle
+import numpy as np
 from os.path import join
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -7,31 +8,16 @@ import tensorflow as tf
 
 leaves_hierachy = None
 
+from make_hierarchy import Node
 
-@dataclass
-class Node:
-    """Class for keeping track of a leaf node"""
-    id: str
-    story: OrderedDict
-    denominator: float
-    data: dict = None
-    name: str = ''
-    vector: list = None
-
-    def getDistance(self, other) -> float:
-        for c in self.story:  # ordered
-            if c in other.story:  # complexity O(1)
-                return self.story[c]
-
-
-def getHierarchy(basePath=''):
+def getHierarchy(basePath='config/'):
     global leaves_hierachy
     if leaves_hierachy is None:
         leaves_hierachy = pickle.load(open(join(basePath, "hierarchy.pkl"), "rb"))
     return leaves_hierachy
 
 
-node0 = Node('0', OrderedDict({}), 1, vector=np.ones[101])
+node0 = Node('0', OrderedDict({}), 1, vector=np.ones(101))
 
 
 def getVector(n):
@@ -41,12 +27,27 @@ def getVector(n):
     else:
         return leaves_hierachy[n-1].vector
 
-
+@tf.function
 def constructBigMatrix(datas):
-    bigTensor = np.zeros(datas.shape + (101,))
-    for i, x1 in enumerate(datas):
-        for j, x2 in enumerate(x1):
-            for k, x3 in enumerate(x2):
-                for m, x4 in enumerate(x3):
-                    bigTensor[i, j, k, m] = getVector(datas[i, j, k, m])
-    return bigTensor
+    datas_size = datas.shape
+
+    @tf.function
+    def expand_values(x):
+        return tf.cast(tf.constant(getVector(x)), dtype=x.dtype)
+
+    datas = tf.reshape(datas,(-1,1))
+
+    datas  = tf.map_fn(expand_values, datas, back_prop=True, parallel_iterations=10, infer_shape=True)
+
+    datas = tf.reshape(datas, datas_size+(101,))
+
+    return datas
+
+
+
+if __name__ == "__main__":
+    leaves = getHierarchy()
+    print(getVector(1))
+    a = tf.Variable(np.random.rand(8,40,40,9))
+    b = constructBigMatrix(a)
+    print(b.shape)
