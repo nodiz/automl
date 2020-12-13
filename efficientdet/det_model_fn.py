@@ -27,7 +27,7 @@ from keras import anchors
 from keras import efficientdet_keras
 from keras import postprocess
 
-from .hierarchy import Node, getHierarchy, constructBigMatrix
+from hierarchy import Node, getHierarchy, constructBigMatrix
 
 _DEFAULT_BATCH_SIZE = 64
 
@@ -231,7 +231,7 @@ def detection_loss(cls_outputs, box_outputs, labels, params):
         momentum=params['positives_momentum'])
   elif positives_momentum < 0:
     num_positives_sum = utils.cross_replica_mean(num_positives_sum)
-  if params.has_key('use_hierarchy') and params['use_hierarchy']:
+  if "use_hierarchy" in params and params['use_hierarchy']:
       classHierarchy = getHierarchy() # list of node objects
 
   levels = cls_outputs.keys()
@@ -271,7 +271,7 @@ def detection_loss(cls_outputs, box_outputs, labels, params):
                             [bs, width, height, -1, params['num_classes']])
     # TensorShape([8, 80, 80, 9, 101])
 
-    target_classes_per_level = labels['cls_targets_%d']
+    target_classes_per_level = labels['cls_targets_%d' % level]
     hierarchyFactor = tf.constant(constructBigMatrix(target_classes_per_level))
     cls_loss *= tf.cast(hierarchyFactor, cls_loss.dtype)
 
