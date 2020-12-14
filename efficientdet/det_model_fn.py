@@ -27,8 +27,6 @@ from keras import anchors
 from keras import efficientdet_keras
 from keras import postprocess
 
-import hierarchy
-
 _DEFAULT_BATCH_SIZE = 64
 
 
@@ -190,7 +188,8 @@ def _box_loss(box_outputs, box_targets, num_positives, delta=0.1):
   box_loss /= normalizer
   return box_loss
 
-
+import pickle
+from os.path import join
 def detection_loss(cls_outputs, box_outputs, labels, params):
   """Computes total detection loss.
 
@@ -214,6 +213,11 @@ def detection_loss(cls_outputs, box_outputs, labels, params):
   """
   # Sum all positives in a batch for normalization and avoid zero
   # num_positives_sum, which would lead to inf loss during training
+  if "use_hierarchy" in params and params['use_hierarchy']:
+    basePath = 'config'
+    leaves_hierachy = pickle.load(open(join(basePath, "hierarchy_vects.pkl"), "rb"))
+    leaves_hierachy = tf.constant(leaves_hierachy, dtype=tf.float32)
+
   num_positives_sum = tf.reduce_sum(labels['mean_num_positives']) + 1.0
   positives_momentum = params.get('positives_momentum', None) or 0
   if positives_momentum > 0:
@@ -270,11 +274,16 @@ def detection_loss(cls_outputs, box_outputs, labels, params):
 
     # TensorShape([8, 80, 80, 9, 101])
 
-    import pdb
-    pdb.set_trace()
+    #import pdb
+    #pdb.set_trace()
 
     if "use_hierarchy" in params and params['use_hierarchy']:
-        hierarchy_factor = cls_targets_at_level @ hierarchy.hierarchyMatrix
+        classOneHot = tf.one_hot(
+        labels['cls_targets_%d' % level],
+        params['num_classes'],
+        dtype=cls_outputs[level].dtype)
+
+        hierarchy_factor = classOneHot @ leaves_hierachy
         cls_loss *= hierarchy_factor
 
     cls_loss *= tf.cast(
