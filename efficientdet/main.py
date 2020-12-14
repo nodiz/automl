@@ -139,7 +139,7 @@ def main(_):
 
   # Parse and override hparams
   config = hparams_config.get_detection_config(FLAGS.model_name)
-  config.override(FLAGS.hparams)
+  config.override(FLAGS.hparams, allow_new_keys=True)
   if FLAGS.num_epochs:  # NOTE: remove this flag after updating all docs.
     config.num_epochs = FLAGS.num_epochs
 
