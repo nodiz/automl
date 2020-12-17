@@ -222,6 +222,7 @@ def detection_loss(cls_outputs, box_outputs, labels, params):
     leaves_hierachy = pickle.load(open(join(basePath, "hierarchy_vects.pkl"), "rb"))
     leaves_hierachy = tf.constant(leaves_hierachy, dtype=tf.float32)
     leaves_hierachy = tf.repeat(leaves_hierachy, 9, axis=0)  # if applying to samples
+    leaves_hierachy = tf.repeat(leaves_hierachy, 9, axis=1)
 
 
   num_positives_sum = tf.reduce_sum(labels['mean_num_positives']) + 1.0
