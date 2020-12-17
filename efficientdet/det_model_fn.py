@@ -272,7 +272,7 @@ def detection_loss(cls_outputs, box_outputs, labels, params):
             dtype=cls_outputs[level].dtype)
         hierarchy_factor = classOneHot @ leaves_hierachy
         hierarchy_factor = tf.reshape(hierarchy_factor,
-                                          [bs, -1, width, height])
+                                          [bs, width, height, -1])
 
         cls_outputs[level] = cls_outputs[level] * hierarchy_factor
 
