@@ -213,10 +213,16 @@ def detection_loss(cls_outputs, box_outputs, labels, params):
   """
   # Sum all positives in a batch for normalization and avoid zero
   # num_positives_sum, which would lead to inf loss during training
-  if "use_hierarchy" in params and params['use_hierarchy']:
+  if "use_hierarchy_loss" in params and params['use_hierarchy_loss']:
     basePath = 'config'
     leaves_hierachy = pickle.load(open(join(basePath, "hierarchy_vects.pkl"), "rb"))
     leaves_hierachy = tf.constant(leaves_hierachy, dtype=tf.float32)
+  if "use_hierarchy_labels" in params and params['use_hierarchy_labels']:
+    basePath = 'config'
+    leaves_hierachy = pickle.load(open(join(basePath, "hierarchy_vects.pkl"), "rb"))
+    leaves_hierachy = tf.constant(leaves_hierachy, dtype=tf.float32)
+    leaves_hierachy = tf.repeat(leaves_hierachy, 7, axis=1, name="embedding hierarchy")  # if applying to samples
+
 
   num_positives_sum = tf.reduce_sum(labels['mean_num_positives']) + 1.0
   positives_momentum = params.get('positives_momentum', None) or 0
@@ -256,6 +262,11 @@ def detection_loss(cls_outputs, box_outputs, labels, params):
                                         [bs, width, height, -1])
     box_targets_at_level = labels['box_targets_%d' % level]
 
+    if "use_hierarchy_labels" in params and params['use_hierarchy_labels']:
+        import pdb
+        pdb.set_trace()
+        cls_outputs[level] = cls_outputs[level] @ leaves_hierachy
+
     cls_loss = focal_loss(
         cls_outputs[level],
         cls_targets_at_level,
@@ -277,7 +288,7 @@ def detection_loss(cls_outputs, box_outputs, labels, params):
     #import pdb
     #pdb.set_trace()
 
-    if "use_hierarchy" in params and params['use_hierarchy']:
+    if "use_hierarchy_loss" in params and params['use_hierarchy_loss']:
         classOneHot = tf.one_hot(
         labels['cls_targets_%d' % level],
         params['num_classes'],
@@ -286,9 +297,11 @@ def detection_loss(cls_outputs, box_outputs, labels, params):
         hierarchy_factor = classOneHot @ leaves_hierachy
         cls_loss *= hierarchy_factor
 
-    cls_loss *= tf.cast(
+    cls_mask = tf.cast(
         tf.expand_dims(tf.not_equal(labels['cls_targets_%d' % level], -2), -1),
         cls_loss.dtype)
+
+    cls_loss *= cls_mask
 
     cls_loss_sum = tf.reduce_sum(cls_loss)
     cls_losses.append(tf.cast(cls_loss_sum, tf.float32))
