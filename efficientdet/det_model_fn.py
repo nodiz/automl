@@ -221,8 +221,8 @@ def detection_loss(cls_outputs, box_outputs, labels, params):
     basePath = 'config'
     leaves_hierachy = pickle.load(open(join(basePath, "hierarchy_vects.pkl"), "rb"))
     leaves_hierachy = tf.constant(leaves_hierachy, dtype=tf.float32)
-    leaves_hierachy = tf.repeat(leaves_hierachy, 9, axis=0)  # if applying to samples
-    leaves_hierachy = tf.repeat(leaves_hierachy, 9, axis=1)
+    # leaves_hierachy = tf.repeat(leaves_hierachy, 9, axis=0)  # if applying to samples
+    # leaves_hierachy = tf.repeat(leaves_hierachy, 9, axis=1)
 
 
   num_positives_sum = tf.reduce_sum(labels['mean_num_positives']) + 1.0
@@ -266,7 +266,15 @@ def detection_loss(cls_outputs, box_outputs, labels, params):
     if "use_hierarchy_labels" in params and params['use_hierarchy_labels']:
         import pdb
         pdb.set_trace()
-        cls_outputs[level] = cls_outputs[level] @ leaves_hierachy
+        classOneHot = tf.one_hot(
+            labels['cls_targets_%d' % level],
+            params['num_classes'],
+            dtype=cls_outputs[level].dtype)
+        hierarchy_factor = classOneHot @ leaves_hierachy
+        hierarchy_factor = tf.reshape(hierarchy_factor,
+                                          [bs, -1, width, height])
+
+        cls_outputs[level] = cls_outputs[level] * hierarchy_factor
 
     cls_loss = focal_loss(
         cls_outputs[level],
