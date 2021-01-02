@@ -145,7 +145,7 @@ class Config(object):
           """Recursively merge two nested dictionary."""
           for k in src.keys():
             if ((k in target and isinstance(target[k], dict) and
-                 isinstance(src[k], collections.abc.Mapping))):
+                 isinstance(src[k], collections.Mapping))):
               merge_dict_recursive(target[k], src[k])
             else:
               target[k] = src[k]
@@ -204,7 +204,7 @@ def default_detection_configs():
   h.max_level = 7
   h.num_scales = 3
   # ratio w/h: 2.0 means w=1.4, h=0.7. Can be computed with k-mean per dataset.
-  h.aspect_ratios = [1.0, 2.0, 0.5]  #[[0.7, 1.4], [1.0, 1.0], [1.4, 0.7]]
+  h.aspect_ratios = [1.0, 2.0, 0.5]  # [[0.7, 1.4], [1.0, 1.0], [1.4, 0.7]]
   h.anchor_scale = 4.0
   # is batchnorm training mode
   h.is_training_bn = True

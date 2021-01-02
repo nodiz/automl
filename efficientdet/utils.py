@@ -113,7 +113,7 @@ def get_ckpt_var_map(ckpt_path, ckpt_scope, var_scope, skip_mismatch=None):
 
   if tf.distribute.get_replica_context():
     replica_id = tf.get_static_value(
-      tf.distribute.get_replica_context().replica_id_in_sync_group)
+        tf.distribute.get_replica_context().replica_id_in_sync_group)
   else:
     replica_id = 0
 
@@ -125,11 +125,11 @@ def get_ckpt_var_map(ckpt_path, ckpt_scope, var_scope, skip_mismatch=None):
 
     if not var_op_name.startswith(var_scope):
       logging.info('skip {} -- does not match scope {}'.format(
-        var_op_name, var_scope))
+          var_op_name, var_scope))
     ckpt_var = ckpt_scope + var_op_name[len(var_scope):]
 
     if (ckpt_var not in ckpt_var_names and
-              var_op_name.endswith('/ExponentialMovingAverage')):
+        var_op_name.endswith('/ExponentialMovingAverage')):
       ckpt_var = ckpt_scope + var_op_name[:-len('/ExponentialMovingAverage')]
 
     if ckpt_var not in ckpt_var_names:
@@ -137,17 +137,18 @@ def get_ckpt_var_map(ckpt_path, ckpt_scope, var_scope, skip_mismatch=None):
         # Skip optimizer variables.
         continue
       if skip_mismatch:
-        logging.info('skip {} ({}) -- not in ckpt'.format(var_op_name, ckpt_var))
+        logging.info('skip {} ({}) -- not in ckpt'.format(
+            var_op_name, ckpt_var))
         continue
       raise ValueError('{} is not in ckpt {}'.format(v.op, ckpt_path))
 
     if v.shape != ckpt_var_name_to_shape[ckpt_var]:
       if skip_mismatch:
         logging.info('skip {} ({} vs {}) -- shape mismatch'.format(
-          var_op_name, v.shape, ckpt_var_name_to_shape[ckpt_var]))
+            var_op_name, v.shape, ckpt_var_name_to_shape[ckpt_var]))
         continue
       raise ValueError('shape mismatch {} ({} vs {})'.format(
-        var_op_name, v.shape, ckpt_var_name_to_shape[ckpt_var]))
+          var_op_name, v.shape, ckpt_var_name_to_shape[ckpt_var]))
 
     if i < 5:
       # Log the first few elements for sanity check.
@@ -218,9 +219,9 @@ class SyncBatchNormalization(tf.keras.layers.BatchNormalization):
       # Compute variance using: Var[X]= E[X^2] - E[X]^2.
       shard_square_of_mean = tf.math.square(shard_mean)
       shard_mean_of_square = shard_variance + shard_square_of_mean
-      group_mean, group_mean_of_square = (
-          replica_context.all_reduce(tf.distribute.ReduceOp.MEAN,
-                                     [shard_mean, shard_mean_of_square]))
+      group_mean = replica_context.all_reduce(tf.distribute.ReduceOp.MEAN, shard_mean)
+      group_mean_of_square = replica_context.all_reduce(tf.distribute.ReduceOp.MEAN,
+                                                        shard_mean_of_square)
       group_variance = group_mean_of_square - tf.math.square(group_mean)
       return (group_mean, group_variance)
     else:
@@ -254,9 +255,7 @@ def batch_norm_class(is_training, strategy=None):
   if is_training and strategy == 'tpu':
     return TpuBatchNormalization
   elif is_training and strategy == 'gpus':
-    # TODO(fsx950223): use SyncBatchNorm after TF bug is fixed (incorrect nccl
-    # all_reduce). See https://github.com/tensorflow/tensorflow/issues/41980
-    return BatchNormalization
+    return SyncBatchNormalization
   else:
     return BatchNormalization
 
@@ -550,7 +549,7 @@ def get_precision(strategy: str, mixed_precision: bool = False):
     if strategy == 'tpu':
       return 'mixed_bfloat16'
 
-    if tf.config.experimental.list_physical_devices('GPU'):
+    if tf.config.list_physical_devices('GPU'):
       return 'mixed_float16'
 
     # TODO(fsx950223): Fix CPU float16 inference
@@ -581,7 +580,7 @@ def float16_scope():
     yield varscope
 
 
-def set_precision_policy(policy_name: Text = None, loss_scale: bool = False):
+def set_precision_policy(policy_name: Text = None):
   """Set precision policy according to the name.
 
   Args:
@@ -597,15 +596,11 @@ def set_precision_policy(policy_name: Text = None, loss_scale: bool = False):
   tf.compat.v1.keras.layers.enable_v2_dtype_behavior()
   # mixed_float16 training is not supported for now, so disable loss_scale.
   # float32 and mixed_bfloat16 do not need loss scale for training.
-  if loss_scale:
-    policy = tf2.keras.mixed_precision.experimental.Policy(policy_name)
-  else:
-    policy = tf2.keras.mixed_precision.experimental.Policy(
-        policy_name, loss_scale=None)
-  tf2.keras.mixed_precision.experimental.set_policy(policy)
+  policy = tf2.keras.mixed_precision.Policy(policy_name)
+  tf2.keras.mixed_precision.set_global_policy(policy)
 
 
-def build_model_with_precision(pp, mm, ii, tt, *args, **kwargs):
+def build_model_with_precision(pp, mm, ii, *args, **kwargs):
   """Build model with its inputs/params for a specified precision context.
 
   This is highly specific to this codebase, and not intended to be general API.
@@ -616,7 +611,6 @@ def build_model_with_precision(pp, mm, ii, tt, *args, **kwargs):
     pp: A string, precision policy name, such as "mixed_float16".
     mm: A function, for rmodel builder.
     ii: A tensor, for model inputs.
-    tt: A bool, If true, it is for training; otherwise, it is for eval.
     *args: A list of model arguments.
     **kwargs: A dict, extra model parameters.
 
@@ -628,13 +622,11 @@ def build_model_with_precision(pp, mm, ii, tt, *args, **kwargs):
     inputs = tf.cast(ii, tf.bfloat16)
     with tf.tpu.bfloat16_scope():
       outputs = mm(inputs, *args, **kwargs)
-    set_precision_policy('float32')
   elif pp == 'mixed_float16':
-    set_precision_policy(pp, loss_scale=tt)
+    set_precision_policy(pp)
     inputs = tf.cast(ii, tf.float16)
     with float16_scope():
       outputs = mm(inputs, *args, **kwargs)
-    set_precision_policy('float32')
   elif not pp or pp == 'float32':
     outputs = mm(ii, *args, **kwargs)
   else:
