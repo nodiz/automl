@@ -215,14 +215,14 @@ def detection_loss(cls_outputs, box_outputs, labels, params):
   # num_positives_sum, which would lead to inf loss during training
   if "use_hierarchy_loss" in params and params['use_hierarchy_loss']:
     basePath = 'config'
-    leaves_hierachy = pickle.load(open(join(basePath, "hierarchy_vects.pkl"), "rb"))
-    leaves_hierachy = tf.constant(leaves_hierachy, dtype=tf.float32)
+    leaves_hierarchy = pickle.load(open(join(basePath, "hierarchy_vects.pkl"), "rb"))
+    leaves_hierarchy = tf.constant(leaves_hierarchy, dtype=tf.float32)
   if "use_hierarchy_labels" in params and params['use_hierarchy_labels']:
     basePath = 'config'
-    leaves_hierachy = pickle.load(open(join(basePath, "hierarchy_vects.pkl"), "rb"))
-    leaves_hierachy = tf.constant(leaves_hierachy, dtype=tf.float32)
-    # leaves_hierachy = tf.repeat(leaves_hierachy, 9, axis=0)  # if applying to samples
-    # leaves_hierachy = tf.repeat(leaves_hierachy, 9, axis=1)
+    leaves_hierarchy = pickle.load(open(join(basePath, "hierarchy_vects.pkl"), "rb"))
+    leaves_hierarchy = tf.constant(leaves_hierarchy, dtype=tf.float32)
+    # leaves_hierarchy = tf.repeat(leaves_hierarchy, 9, axis=0)  # if applying to samples
+    # leaves_hierarchy = tf.repeat(leaves_hierarchy, 9, axis=1)
 
 
   num_positives_sum = tf.reduce_sum(labels['mean_num_positives']) + 1.0
@@ -270,10 +270,9 @@ def detection_loss(cls_outputs, box_outputs, labels, params):
             labels['cls_targets_%d' % level],
             params['num_classes'],
             dtype=cls_outputs[level].dtype)
-        hierarchy_factor = classOneHot @ leaves_hierachy
+        hierarchy_factor = classOneHot @ leaves_hierarchy
         hierarchy_factor = tf.reshape(hierarchy_factor,
                                           [bs, width, height, -1])
-
         cls_outputs[level] = cls_outputs[level] * hierarchy_factor
 
     cls_loss = focal_loss(
@@ -302,8 +301,8 @@ def detection_loss(cls_outputs, box_outputs, labels, params):
         labels['cls_targets_%d' % level],
         params['num_classes'],
         dtype=cls_outputs[level].dtype)
-
-        hierarchy_factor = classOneHot @ leaves_hierachy
+        leaves_hierarchy = tf.math.sqrt(leaves_hierarchy)
+        hierarchy_factor = classOneHot @ leaves_hierarchy
         cls_loss *= hierarchy_factor
 
     cls_mask = tf.cast(
