@@ -433,7 +433,7 @@ class InputReader:
       return dataset
 
     dataset = dataset.interleave(
-        _prefetch_dataset, num_parallel_calls=tf.data.AUTOTUNE)
+        _prefetch_dataset, num_parallel_calls=tf.data.experimental.AUTOTUNE)
     dataset = dataset.with_options(self.dataset_options)
     if self._is_training:
       dataset = dataset.shuffle(64, seed=seed)
@@ -448,12 +448,12 @@ class InputReader:
                                                  anchor_labeler, params)
     # pylint: enable=g-long-lambda
     dataset = dataset.map(
-        map_fn, num_parallel_calls=tf.data.AUTOTUNE)
+        map_fn, num_parallel_calls=tf.data.experimental.AUTOTUNE)
     dataset = dataset.prefetch(batch_size)
     dataset = dataset.batch(batch_size, drop_remainder=params['drop_remainder'])
     dataset = dataset.map(
         lambda *args: self.process_example(params, batch_size, *args))
-    dataset = dataset.prefetch(tf.data.AUTOTUNE)
+    dataset = dataset.prefetch(tf.data.experimental.AUTOTUNE)
     if self._is_training:
       dataset = dataset.repeat()
     if self._use_fake_data:

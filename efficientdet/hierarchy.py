@@ -11,6 +11,9 @@ def getHierarchy(basePath='config/'):
         leaves_hierachy = pickle.load(open(join(basePath, "hierarchy_vects.pkl"), "rb"))
     return tf.constant(leaves_hierachy)
 
+hierarchyMatrix = getHierarchy()
+
+
 
 if __name__ == "__main__":
     leaves = getHierarchy()
